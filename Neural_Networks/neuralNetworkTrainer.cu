@@ -1,545 +1,457 @@
-//standard includes
 #include <iostream>
-
 #include <fstream>
 #include <math.h>
-
 #include <algorithm>
-
-#include <omp.h>
-
 #include <cuda.h>
-
 #include <cuda_runtime.h>
-
-#include <driver_functions.h>
-
 #include <cublas_v2.h>
-
-#include "nnTrain.h"
-
+#include "neuralNetworkTrainer.h"
 #include "CycleTimer.h"
 
 using namespace std;
 
-__global__ void
-back_prop_kernel(float *device_output, float *inP, float *m_hidden, float* weights_2, float* o_errG, int nInput, int nHidden, int nOutput,  float l_R) 
-{
-	int linearThreadIndex = threadIdx.x;
-	
-	int unit = blockIdx.x;
-   
-    __shared__ float weightedSum[1];
-    
-    if (linearThreadIndex==0) 
-    {
-        for (int i=0; i<nOutput; i++) 
-        {
-         
-          weightedSum[0] += weights_2[unit*nOutput + i] * o_errG[i];
-        
-        }
-    
-    }
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                        \
+        cudaError_t err = (call);                                               \
+        if (err != cudaSuccess) {                                               \
+            fprintf(stderr, "CUDA error at %s:%d — %s\n",                     \
+                    __FILE__, __LINE__, cudaGetErrorString(err));               \
+            exit(EXIT_FAILURE);                                                 \
+        }                                                                       \
+    } while (0)
 
-    __syncthreads();
-
-    if (linearThreadIndex < nInput) 
-    {
-    	
-        device_output[linearThreadIndex*nHidden + unit] = l_R * inP[linearThreadIndex] * m_hidden[unit]*(1 - m_hidden[unit]) * weightedSum[0];
-    
-    }
-
-}
-
-
-__global__ void 
-back_prop_kernel_batch(float *device_output, float *inP, float *m_hidden, float* weights_2, float* o_errG, int nInput, int nHidden, int nOutput, float l_R, int batchSize) 
+// ---------------------------------------------------------------------------
+// Backward kernel: compute input-hidden weight gradients for a single sample.
+//
+// One block per hidden unit (blockIdx.x = hidden unit index).
+// Threads cover input units (threadIdx.x < nInput+1).
+//
+// Warp-shuffle reduction replaces the original single-thread sequential loop.
+// Works correctly when nOutput <= 32 (MNIST: 10 outputs — fine).
+//
+// Output: device_output[(linearThreadIndex) * nHidden + unit]
+//         = lr * input[linearThreadIndex] * h*(1-h) * weightedSum
+// ---------------------------------------------------------------------------
+__global__ void back_prop_kernel(
+    float* device_output,
+    const float* inP,
+    const float* m_hidden,
+    const float* weights_2,
+    const float* o_errG,
+    int nInput, int nHidden, int nOutput, float l_R)
 {
     int linearThreadIndex = threadIdx.x;
-    
-    int unit = blockIdx.x%nHidden;
-    
-    int batch = blockIdx.x/nHidden; 
-    
-    __shared__ float weightedSum[1];
-    
-    float temp = 0.0;
-    
-    if (linearThreadIndex ==0 && unit<nHidden) 
-    {
-        for (int i=0; i<nOutput; i++) 
-        { 
-        
-            weightedSum[0] += weights_2[unit*nOutput + i] * o_errG[batch*(nOutput+1) +i];
-        
-        }
-    
-    }
-    
+    int unit = blockIdx.x;  // hidden unit index
+
+    // Each thread in the first warp handles one output unit for the weighted sum
+    float ws = 0.f;
+    if (linearThreadIndex < nOutput)
+        ws = weights_2[unit * nOutput + linearThreadIndex] * o_errG[linearThreadIndex];
+
+    // Warp-level reduction (safe for nOutput <= 32)
+    for (int mask = 16; mask > 0; mask >>= 1)
+        ws += __shfl_xor_sync(0xffffffff, ws, mask);
+
+    float weightedSum = ws;  // broadcast: all threads in warp 0 hold the total
+
     __syncthreads();
-   
-    if (linearThreadIndex < nInput) 
-    {
-        temp = l_R * inP[batch*(nInput+1) + linearThreadIndex] * m_hidden[batch*(nHidden+1) + unit]*(1 - m_hidden[batch*(nHidden+1) + unit]) * weightedSum[0];
-        
-        atomicAdd(&device_output[linearThreadIndex*nHidden + unit], temp);
-    
-    } 
 
+    float h = m_hidden[unit];
+    float delta = l_R * h * (1.f - h) * weightedSum;
 
+    if (linearThreadIndex < nInput)
+        device_output[linearThreadIndex * nHidden + unit] =
+            inP[linearThreadIndex] * delta;
 }
 
-
-nnTrain::nnTrain( neuralNetwork *nn )	:	NN(nn),
-																	eP(0),
-																	l_R(lR),
-																	max_eP(m_epchs),
-																	d_acc(accur_d),																	
-																	u_B(true),
-																	train_Acc(0),
-																	val_Acc(0),
-																	gen_Acc(0)																	
+// ---------------------------------------------------------------------------
+// Backward kernel: compute input-hidden weight gradients for a batch.
+//
+// One block per (batch, hidden_unit) pair: blockIdx.x = batch*nHidden + unit.
+// Uses warp-shuffle reduction for the weighted sum over output units.
+// atomicAdd accumulates across the batch dimension into the shared delta buffer.
+// ---------------------------------------------------------------------------
+__global__ void back_prop_kernel_batch(
+    float* device_output,
+    const float* inP,
+    const float* m_hidden,
+    const float* weights_2,
+    const float* o_errG,
+    int nInput, int nHidden, int nOutput, float l_R, int batchSize)
 {
+    int linearThreadIndex = threadIdx.x;
+    int unit  = blockIdx.x % nHidden;
+    int batch = blockIdx.x / nHidden;
 
+    float ws = 0.f;
+    if (linearThreadIndex < nOutput)
+        ws = weights_2[unit * nOutput + linearThreadIndex]
+           * o_errG[batch * (nOutput + 1) + linearThreadIndex];
 
-	d_Inp = new( float*[NN->nInput + 1] );
-    
-    d_Inp[0] = new (float[((NN->nInput) + 1)*(NN->nHidden)]);
-    
-    for ( int i=1; i <= NN->nInput; i++ ) 
-    {
-	
-		d_Inp[i] = d_Inp[i-1] + NN->nHidden;
-	
-	}
+    for (int mask = 16; mask > 0; mask >>= 1)
+        ws += __shfl_xor_sync(0xffffffff, ws, mask);
 
-	for ( int i=0; i <= NN->nInput; i++ ) 
-	{
-	
-		for ( int j=0; j < NN->nHidden; j++ ) d_Inp[i][j] = 0;		
-	
-	}
+    float weightedSum = ws;
 
+    __syncthreads();
 
+    float h = m_hidden[batch * (nHidden + 1) + unit];
+    float delta = l_R * h * (1.f - h) * weightedSum;
 
-	d_Out = new( float*[NN->nHidden + 1] );
-	
-	for ( int i=0; i <= NN->nHidden; i++ ) 
-	{
-	
-		d_Out[i] = new (float[NN->nOutput]);			
-	
-		for ( int j=0; j < NN->nOutput; j++ ) d_Out[i][j] = 0;		
-	
-	}
-
-	
-	h_errG = new( float[(NN->batchSize)*(NN->nHidden + 1)] );
-	
-	for (int b = 0; b<NN->batchSize; b++) 
-	{
-	    for(int i = 0; i < NN->nHidden+1; i++) 
-	    { 
-        
-            h_errG[b*(NN->nHidden+1) + i] = 0;
-        
-        }
-	
-	}
-	
-	o_errG = new( float[(NN->batchSize)*(NN->nOutput + 1)] );
-	
-	for (int b = 0; b<NN->batchSize; b++) 
-	{
-	
-	    for(int i = 0; i < NN->nOutput+1; i++) 
-	    { 
-        
-            o_errG[b*(NN->nOutput+1) + i] = 0;
-        
-        }
-	
-	}
-
-    cudaMalloc(&d_Out1, sizeof(float) * (NN->batchSize)*((NN->nInput)+1)*(NN->nHidden));
-    
-    cudaMalloc(&inP, sizeof(float) * (NN->batchSize)*((NN->nInput)+1));
-    
-    cudaMalloc(&m_hidden, sizeof(float) * (NN->batchSize)*(((NN->nHidden) +1)));
-    
-    cudaMalloc(&weights_2, sizeof(float) * ((NN->nHidden)+1)*(NN->nOutput));
-    
-    cudaMalloc(&o_errG1, sizeof(float)*((NN->nOutput) +1));
-    
-
+    if (linearThreadIndex < nInput) {
+        float grad = inP[batch * (nInput + 1) + linearThreadIndex] * delta;
+        atomicAdd(&device_output[linearThreadIndex * nHidden + unit], grad);
+    }
 }
 
+// ---------------------------------------------------------------------------
+// GPU weight update: weights += deltas, then zero deltas
+// ---------------------------------------------------------------------------
+__global__ void weight_update_kernel(float* weights, float* deltas, int count)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        weights[i] += deltas[i];
+        deltas[i] = 0.f;
+    }
+}
 
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+nnTrain::nnTrain(neuralNetwork* nn)
+    : NN(nn),
+      eP(0),
+      l_R(DEFAULT_LR),
+      max_eP(DEFAULT_EPOCHS),
+      d_acc(DEFAULT_ACCUR),
+      u_B(true),
+      train_Acc(0), val_Acc(0), gen_Acc(0),
+      l_E(false), logR(1), lastLog(-1)
+{
+    // ---- host delta matrices ----
+    d_Inp    = new float*[NN->nInput + 1];
+    d_Inp[0] = new float[(NN->nInput + 1) * NN->nHidden]();
+    for (int i = 1; i <= NN->nInput; i++)
+        d_Inp[i] = d_Inp[i - 1] + NN->nHidden;
+
+    d_Out = new float*[NN->nHidden + 1];
+    for (int i = 0; i <= NN->nHidden; i++) {
+        d_Out[i] = new float[NN->nOutput]();
+    }
+
+    // ---- host error gradient arrays ----
+    h_errG = new float[NN->batchSize * (NN->nHidden + 1)]();
+    o_errG = new float[NN->batchSize * (NN->nOutput + 1)]();
+
+    // ---- device buffers ----
+    CUDA_CHECK(cudaMalloc(&d_dInp,    sizeof(float) * (NN->nInput + 1)  * NN->nHidden));
+    CUDA_CHECK(cudaMalloc(&d_dOut,    sizeof(float) * (NN->nHidden + 1) * NN->nOutput));
+    CUDA_CHECK(cudaMalloc(&d_inP,     sizeof(float) * NN->batchSize * (NN->nInput  + 1)));
+    CUDA_CHECK(cudaMalloc(&d_mHidden, sizeof(float) * NN->batchSize * (NN->nHidden + 1)));
+    CUDA_CHECK(cudaMalloc(&d_w2,      sizeof(float) * (NN->nHidden + 1) * NN->nOutput));
+    CUDA_CHECK(cudaMalloc(&d_oErrG,   sizeof(float) * NN->batchSize * (NN->nOutput + 1)));
+
+    CUDA_CHECK(cudaMemset(d_dInp, 0, sizeof(float) * (NN->nInput + 1)  * NN->nHidden));
+    CUDA_CHECK(cudaMemset(d_dOut, 0, sizeof(float) * (NN->nHidden + 1) * NN->nOutput));
+}
+
+// ---------------------------------------------------------------------------
+// Destructor
+// ---------------------------------------------------------------------------
 nnTrain::~nnTrain()
 {
-	
-	for (int i=0; i <= NN->nInput; i++) delete[] d_Inp[i];
-	
-	delete[] d_Inp;
+    delete[] d_Inp[0];   // only [0] owns the flat allocation
+    delete[] d_Inp;
 
-	for (int j=0; j <= NN->nHidden; j++) delete[] d_Out[j];
-	
-	delete[] d_Out;
+    for (int i = 0; i <= NN->nHidden; i++)
+        delete[] d_Out[i];
+    delete[] d_Out;
 
-	cudaFree(d_Out1);
-	
-	cudaFree(inP);
-	
-	cudaFree(m_hidden);
-	
-	cudaFree(weights_2);
-	
-	cudaFree(o_errG1);
-	
+    delete[] h_errG;
+    delete[] o_errG;
+
+    cudaFree(d_dInp);
+    cudaFree(d_dOut);
+    cudaFree(d_inP);
+    cudaFree(d_mHidden);
+    cudaFree(d_w2);
+    cudaFree(d_oErrG);
 }
 
-
-void nnTrain::setTrain( double learningRate, bool m_batch )
+void nnTrain::setTrain(double learningRate, bool useBatch)
 {
-	
-	l_R = learningRate;
-	
-	u_B = m_batch;
-
+    l_R = (float)learningRate;
+    u_B = useBatch;
 }
 
-void nnTrain::setStop( int mEP, double dAcc )
+void nnTrain::setStop(int maxEpochs, double desiredAccuracy)
 {
-
-	max_eP = mEP;
-
-	d_acc = dAcc;	
-
+    max_eP = maxEpochs;
+    d_acc  = (float)desiredAccuracy;
 }
 
-void nnTrain::e_Log(const char* filename, int resolution = 1)
+void nnTrain::e_Log(const char* filename, int resolution)
 {
-	
-	if ( ! logFile.is_open() )
-	{
-		
-		logFile.open(filename, ios::out);
-
-		if ( logFile.is_open() )
-		{
-			
-			logFile << "Epoch,Training Set Accuracy, Generalization Set Accuracy,Training Set MSE, Generalization Set MSE" << endl;
-			
-			
-			l_E = true;
-			
-			
-			logR = resolution;
-			
-			lastLog = -resolution;
-		
-		}
-	
-	}
-
+    if (!logFile.is_open()) {
+        logFile.open(filename, ios::out);
+        if (logFile.is_open()) {
+            logFile << "Epoch,TrainingAccuracy,GeneralizationAccuracy" << endl;
+            l_E    = true;
+            logR   = resolution;
+            lastLog = -resolution;
+        }
+    }
 }
 
-
-inline float nnTrain::get_oerrG( float dVal, float oVal)
+// ---------------------------------------------------------------------------
+// Compute output-layer error gradient for one sample at batch index batchIdx.
+// o_errG[batchIdx * (nOutput+1) + k] = o*(1-o)*(d-o)
+// ---------------------------------------------------------------------------
+inline float nnTrain::get_oerrG(float dVal, float oVal)
 {
-	
-	return oVal * ( 1 - oVal ) * ( dVal - oVal );
-
+    return oVal * (1.f - oVal) * (dVal - oVal);
 }
 
-
-float nnTrain::get_herrG( int j )
-
+void nnTrain::computeOutputErrorGrads(float* desiredOutputs, int batchIdx)
 {
-	
-	float weightedSum = 0;
-	
-	for( int k = 0; k < NN->nOutput; k++ ) 
-	{
-	
-		weightedSum += NN->wHiddenOutput[j][k] * o_errG[k];
-	
-	}
-
-	
-	return NN->hiddenNeurons[j] * ( 1 - NN->hiddenNeurons[j] ) * weightedSum;
-
+    int base = batchIdx * (NN->nOutput + 1);
+    int oBase = batchIdx * NN->nOutput;
+    for (int k = 0; k < NN->nOutput; k++)
+        o_errG[base + k] = get_oerrG(desiredOutputs[k], NN->outputNeurons[oBase + k]);
 }
 
-float nnTrain::get_herrGB( int j, int b )
+// ---------------------------------------------------------------------------
+// Main training loop
+// ---------------------------------------------------------------------------
+void nnTrain::netTrain(trainingDataSet* trainSet)
 {
-	
-	float weightedSum = 0;
-	
-	for( int k = 0; k < NN->nOutput; k++ ) 
-	{
-	
-		weightedSum += NN->wHiddenOutput[j][k] * o_errG[b*k];
-	
-	}
+    cout << "\n Training Starts:\n----\n"
+         << " LR: " << l_R
+         << "  MaxEpochs: " << max_eP
+         << "  BatchMode: " << u_B << "\n"
+         << " Inputs: " << NN->nInput
+         << "  Hidden: " << NN->nHidden
+         << "  Outputs: " << NN->nOutput
+         << "\n----\n\n";
 
-	
-	return NN->hiddenNeurons[j] * ( 1 - NN->hiddenNeurons[j] ) * weightedSum;
+    eP      = 0;
+    lastLog = -logR;
 
+    while ((train_Acc < d_acc || gen_Acc < d_acc) && eP < max_eP) {
+        double prevT = train_Acc;
+        double prevG = gen_Acc;
+
+        r_TrainEP(trainSet->trainingSet, (int)eP);
+
+        gen_Acc = (float)NN->getSetAccuracy(trainSet->generalizationSet);
+
+        if (l_E && logFile.is_open() && (eP - lastLog == logR)) {
+            logFile << eP << "," << train_Acc << "," << gen_Acc << "\n";
+            lastLog = (int)eP;
+        }
+
+        if (ceil(prevT) != ceil(train_Acc) || ceil(prevG) != ceil(gen_Acc))
+            cout << "Epoch: " << eP
+                 << "  Train: " << train_Acc << "%"
+                 << "  Gen: "   << gen_Acc   << "%\n";
+
+        eP++;
+    }
+
+    val_Acc = (float)NN->getSetAccuracy(trainSet->validationSet);
+
+    if (logFile.is_open()) {
+        logFile << eP << "," << train_Acc << "," << gen_Acc << "\n\n";
+        logFile << "Training Complete — Epochs: " << eP
+                << "  Validation Accuracy: " << val_Acc << "\n";
+    }
+
+    cout << "\nTraining Complete — Elapsed Epochs: " << eP << "\n"
+         << " Validation Accuracy: " << val_Acc << "%\n\n";
 }
 
-void nnTrain::netTrain( trainingDataSet* trainSet )
+// ---------------------------------------------------------------------------
+// Run one training epoch (single-sample or batch mode)
+// ---------------------------------------------------------------------------
+void nnTrain::r_TrainEP(std::vector<dataEntry*>& trainingSet, int epoch)
 {
-	cout	<< endl << " Training Starts: " << endl
-			<< "----" << endl
-			<< " Learning Rate: " << l_R << ", Maximum number of Epochs: " << max_eP << ", Use Batch or Not: " << u_B << endl
-			<< " " << NN->nInput << " Number of Input Neurons, " << NN->nHidden << " Number of Hidden Neurons, " << NN->nOutput << "Number of Output Neurons" << endl
-			<< "----" << endl << endl;
+    double startIter = CycleTimer::currentSeconds();
+    double incorrectPatterns = 0;
 
-	
-	eP = 0;
-	lastLog = -logR;
-		
-	
-	while (	( train_Acc < d_acc || gen_Acc < d_acc ) && epoch < max_eP )				
-	{			
-		
-		double previousTAccuracy = train_Acc;
-		
-		double previousGAccuracy = gen_Acc;
+    // Per-epoch timing accumulators (printed once at end of epoch)
+    double totalForward = 0, totalBack = 0;
 
-		
-		r_TrainEP( trainSet->trainingSet , eP);
+    vector<float*> largePattern;
+    vector<float*> largeTarget;
+    largePattern.reserve(NN->batchSize);
+    largeTarget.reserve(NN->batchSize);
 
-		
-		gen_Acc = NN->getSetAccuracy( trainSet->generalizationSet );
+    for (int tp = 0; tp < (int)trainingSet.size(); tp++) {
+        largePattern.push_back(trainingSet[tp]->pattern);
+        largeTarget.push_back(trainingSet[tp]->target);
 
-	
-		if ( l_E && logFile.is_open() && ( eP - lastLog == logR ) ) 
-		{
-		
-			logFile << eP << "," << train_Acc << "," << gen_Acc << endl;
-		
-			lastLog = eP;
-		
-		}
-		
-		
-		if ( ceil(previousTAccuracy) != ceil(train_Acc) || ceil(previousGAccuracy) != ceil(gen_Acc) ) 
-		{	
-		
-			cout << "Epoch :" << eP;
-		
-			cout << " TSet Acc:" << train_Acc << "%" ;
-		
-			cout << " GSet Acc:" << gen_Acc << "%" << endl;
-		
-		}
-		
-		
-		eP++;
+        bool flushBatch = u_B &&
+            ((tp == (int)trainingSet.size() - 1) ||
+             ((int)largePattern.size() == NN->batchSize));
 
-	}
+        if (flushBatch) {
+            double t0 = CycleTimer::currentSeconds();
+            NN->feedForwardBatch(largePattern);
+            double t1 = CycleTimer::currentSeconds();
+            backp_B(largeTarget);
+            double t2 = CycleTimer::currentSeconds();
+            w_Update();
+            totalForward += t1 - t0;
+            totalBack    += t2 - t1;
 
-	val_Acc = NN->getSetAccuracy(trainSet->validationSet);
+            // Accuracy check on last sample in batch
+            int B = (int)largePattern.size();
+            for (int b = 0; b < B; b++) {
+                int predicted = (int)distance(NN->outputNeurons + b * NN->nOutput,
+                    max_element(NN->outputNeurons + b * NN->nOutput,
+                                NN->outputNeurons + b * NN->nOutput + NN->nOutput));
+                int expected = (int)distance(largeTarget[b],
+                    max_element(largeTarget[b], largeTarget[b] + NN->nOutput));
+                if (predicted != expected) incorrectPatterns++;
+            }
 
-	logFile << epoch << "," << train_Acc << "," << gen_Acc << endl << endl;
+            largePattern.clear();
+            largeTarget.clear();
 
-	logFile << "Training Complete!!! - > Elapsed Epochs: " << eP << " Validation Set Accuracy: " << val_Acc << endl;
-			
-	cout << endl << "Training Complete!!! - > Elapsed Epochs: " << eP << endl;
+        } else if (!u_B) {
+            double t0 = CycleTimer::currentSeconds();
+            NN->feedForward(trainingSet[tp]->pattern);
+            double t1 = CycleTimer::currentSeconds();
+            backp(trainingSet[tp]->target);
+            double t2 = CycleTimer::currentSeconds();
+            totalForward += t1 - t0;
+            totalBack    += t2 - t1;
 
-	cout << " Validation Set Accuracy: " << val_Acc << endl << endl;
+            int predicted = (int)distance(NN->outputNeurons,
+                max_element(NN->outputNeurons, NN->outputNeurons + NN->nOutput));
+            int expected = (int)distance(trainingSet[tp]->target,
+                max_element(trainingSet[tp]->target,
+                            trainingSet[tp]->target + NN->nOutput));
+            if (predicted != expected) incorrectPatterns++;
+        }
+    }
 
+    train_Acc = 100.f - (float)(incorrectPatterns / trainingSet.size() * 100.0);
+
+    double timeIter = CycleTimer::currentSeconds() - startIter;
+    printf("Epoch %d — Total: %.4fs  Forward: %.4fs  Backprop: %.4fs\n",
+           epoch, timeIter, totalForward, totalBack);
 }
 
-void nnTrain::r_TrainEP( vector<dataEntry*> trainingSet , int eP)
-
+// ---------------------------------------------------------------------------
+// Batch backpropagation
+// ---------------------------------------------------------------------------
+void nnTrain::backp_B(std::vector<float*>& desiredOutputsVector)
 {
-	double startIter = CycleTimer::currentSeconds();
-	
-	double incorrectPatterns = 0;
-	
-	vector<float*>largePattern;
-	
-	vector<float*>largeTarget; 
+    int B = (int)desiredOutputsVector.size();
 
-	double startForward;
-	
-	double endForward;
+    // 1. Compute output error gradients on CPU
+    for (int b = 0; b < B; b++)
+        computeOutputErrorGrads(desiredOutputsVector[b], b);
 
-	double startBack;
-	
-	double endBack;
+    // 2. Accumulate hidden-output weight deltas on CPU
+    for (int b = 0; b < B; b++) {
+        for (int j = 0; j <= NN->nHidden; j++) {
+            float h = NN->hiddenNeurons[b * (NN->nHidden + 1) + j];
+            for (int k = 0; k < NN->nOutput; k++)
+                d_Out[j][k] += l_R * h * o_errG[b * (NN->nOutput + 1) + k];
+        }
+    }
 
+    // 3. Upload data for input-hidden gradient kernel
+    CUDA_CHECK(cudaMemcpy(d_inP, NN->inputNeurons,
+        sizeof(float) * B * (NN->nInput + 1), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_mHidden, NN->hiddenNeurons,
+        sizeof(float) * B * (NN->nHidden + 1), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w2, NN->wHiddenOutput[0],
+        sizeof(float) * (NN->nHidden + 1) * NN->nOutput, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_oErrG, o_errG,
+        sizeof(float) * B * (NN->nOutput + 1), cudaMemcpyHostToDevice));
 
+    // 4. Launch gradient kernel: one block per (batch x hidden_unit)
+    dim3 gridDim(NN->nHidden * B);
+    dim3 blockDim(max(NN->nInput + 1, 32));  // at least one warp
 
-	for ( int tp = 0; tp < (int) trainingSet.size(); tp++)
-	{
-		largePattern.push_back(trainingSet[tp]->pattern);
-		
-		largeTarget.push_back(trainingSet[tp]->target);
-	
-		if (u_B && ((tp == (int) trainingSet.size()-1) || (largePattern.size() == NN->batchSize))) 
-		{
-			startForward = CycleTimer::currentSeconds();
-			
-			NN->feedForwardBatch( largePattern );
-			
-			endForward = CycleTimer::currentSeconds();
+    back_prop_kernel_batch<<<gridDim, blockDim>>>(
+        d_dInp, d_inP, d_mHidden, d_w2, d_oErrG,
+        NN->nInput + 1, NN->nHidden, NN->nOutput, l_R, B);
 
-			startBack = CycleTimer::currentSeconds();
-			
-			backp_B( largeTarget );
-			
-			endBack = CycleTimer::currentSeconds();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-			w_Update();
-			
-			largePattern.clear();
-			
-			largeTarget.clear();
-		
-		} 
-
-		else 
-		{
-			startForward = CycleTimer::currentSeconds();
-			
-			NN->feedForward( trainingSet[tp]->pattern );
-			
-			endForward = CycleTimer::currentSeconds();
-
-			startBack = CycleTimer::currentSeconds();
-			
-			backp( trainingSet[tp]->target );
-			
-			endBack = CycleTimer::currentSeconds();
-		
-		}
-
-		
-	    double timeForward = endForward - startForward;
-	    
-	    double timeBack = endBack - startBack;
-	    
-	    double timeBoth = endBack - startForward;
-
-	    if (eP) 
-	    {
-		 
-		     printf("Forward: %f\n", timeForward);
-		 
-		     printf("Backprop: %f\n", timeBack);
-		 
-		     printf("Both: %f\n", timeBoth);
-	    
-	    }
-
-	    
-		int predicted = distance(NN->outputNeurons, max_element(NN->outputNeurons, NN->outputNeurons + NN->nOutput));
-		
-		int expected = distance(trainingSet[tp]->target, max_element(trainingSet[tp]->target, trainingSet[tp]->target + NN->nOutput));
-		
-		if (predicted != expected) incorrectPatterns++;
-			
-		
-	}
-
-	
-	
-	train_Acc = 100 - (incorrectPatterns/trainingSet.size() * 100);
-
-	double endIter = CycleTimer::currentSeconds();
-    
-    double timeIter = endIter - startIter;
-
-    printf("Iteration: %f\n", timeIter);
-
-
+    // 5. Copy input-hidden deltas back to host
+    CUDA_CHECK(cudaMemcpy(d_Inp[0], d_dInp,
+        sizeof(float) * (NN->nInput + 1) * NN->nHidden, cudaMemcpyDeviceToHost));
 }
 
-void nnTrain::backp_B(vector<float*> desiredOutputsVector) 
-
+// ---------------------------------------------------------------------------
+// Single-sample backpropagation
+// ---------------------------------------------------------------------------
+void nnTrain::backp(float* desiredOutputs)
 {
+    // 1. Output error gradients
+    computeOutputErrorGrads(desiredOutputs, 0);
 
+    // 2. Hidden-output weight deltas
+    for (int j = 0; j <= NN->nHidden; j++) {
+        float h = NN->hiddenNeurons[j];
+        for (int k = 0; k < NN->nOutput; k++)
+            d_Out[j][k] = l_R * h * o_errG[k];
+    }
 
-	double startCuda = CycleTimer::currentSeconds();
-	
-	dim3 blockDim(1024,1);
-    
-    dim3 gridDim(NN->nHidden);
-    
-    cudaMemcpy(inP, NN->inputNeurons, sizeof(float) * ((NN->nInput)+1) *(NN->batchSize), cudaMemcpyHostToDevice);
-    
-    cudaMemcpy(hidden, NN->hiddenNeurons, (NN->batchSize)*((NN->nHidden)+1)*sizeof(float), cudaMemcpyHostToDevice);
-    
-    cudaMemcpy(weights_2, NN->wHiddenOutput[0], ((NN->nHidden)+1)*(NN->nOutput)*sizeof(float), cudaMemcpyHostToDevice);
-    
-    cudaMemcpy(o_errG1, o_errG, sizeof(float) * (NN->batchSize)*((NN->nOutput)+1), cudaMemcpyHostToDevice);
-    
-    back_prop_kernel_batch<<<gridDim, blockDim>>>(d_Out1, inP, m_hidden, weights_2, o_errG1, (NN->nInput)+1, NN->nHidden, NN->nOutput, l_R, 8);
-    
-    cudaMemcpy(d_Inp[0], d_Out1, ((NN->nInput) +1)*(NN->nHidden)*sizeof(float), cudaMemcpyDeviceToHost);
+    // 3. Upload data for input-hidden gradient kernel
+    CUDA_CHECK(cudaMemcpy(d_inP, NN->inputNeurons,
+        sizeof(float) * (NN->nInput + 1), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_mHidden, NN->hiddenNeurons,
+        sizeof(float) * (NN->nHidden + 1), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w2, NN->wHiddenOutput[0],
+        sizeof(float) * (NN->nHidden + 1) * NN->nOutput, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_oErrG, o_errG,
+        sizeof(float) * (NN->nOutput + 1), cudaMemcpyHostToDevice));
 
+    // 4. One block per hidden unit
+    back_prop_kernel<<<NN->nHidden, max(NN->nInput + 1, 32)>>>(
+        d_dInp, d_inP, d_mHidden, d_w2, d_oErrG,
+        NN->nInput + 1, NN->nHidden, NN->nOutput, l_R);
 
-    double endCuda = CycleTimer::currentSeconds();
-    
-    double timeCuda = endCuda - startCuda;
- 
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(d_Inp[0], d_dInp,
+        sizeof(float) * (NN->nInput + 1) * NN->nHidden, cudaMemcpyDeviceToHost));
+
+    w_Update();
 }
 
-void nnTrain::backp( float* desiredOutputs )
-
-{	
-	
-	dim3 blockDim(1024, 1);
-    
-    dim3 gridDim(128);
-    
-    cudaMemcpy(input, NN->inputNeurons, sizeof(float) * ((NN->nInput)+1), cudaMemcpyHostToDevice);
-    
-    cudaMemcpy(m_hidden, NN->hiddenNeurons, ((NN->nHidden)+1)*sizeof(float), cudaMemcpyHostToDevice);
-    
-    cudaMemcpy(weights_2, NN->wHiddenOutput[0], ((NN->nHidden)+1)*(NN->nOutput)*sizeof(float), cudaMemcpyHostToDevice);
-    
-    cudaMemcpy(o_errG1, o_errG, sizeof(float) * ((NN->nOutput)+1), cudaMemcpyHostToDevice);
-    
-    back_prop_kernel<<<gridDim, blockDim>>>(d_Out1, input, m_hidden, weights_2, o_errG1, (NN->nInput)+1, NN->nHidden, NN->nOutput, l_R);
-    
-    cudaMemcpy(d_Inp[0], d_Out1, (NN->batchSize)*(NN->nInput +1)*(NN->nHidden)*sizeof(float), cudaMemcpyDeviceToHost);
-	
-	if ( !u_B ) w_Update();
-
-}
-
+// ---------------------------------------------------------------------------
+// Apply accumulated weight deltas and reset them for the next step
+// ---------------------------------------------------------------------------
 void nnTrain::w_Update()
 {
-	
-	for (int i = 0; i <= NN->nInput; i++)
-	{
-		for (int j = 0; j < NN->nHidden; j++) 
-		{
-			
-			NN->wInputHidden[i][j] += d_Inp[i][j];	
-			
-			
-			if (u_B) d_Inp[i][j] = 0;				
-		}
-	}
-	
-	
-	for (int j = 0; j <= NN->nHidden; j++)
-	{
-		for (int k = 0; k < NN->nOutput; k++) 
-		{					
-			
-			NN->wHiddenOutput[j][k] += d_Out[j][k];
-			
-			
-			if (u_B)d_Out[j][k] = 0;
-		}
-	}
+    // Input-hidden weights
+    for (int i = 0; i <= NN->nInput; i++) {
+        for (int j = 0; j < NN->nHidden; j++) {
+            NN->wInputHidden[i][j] += d_Inp[i][j];
+            d_Inp[i][j] = 0.f;
+        }
+    }
+
+    // Hidden-output weights
+    for (int j = 0; j <= NN->nHidden; j++) {
+        for (int k = 0; k < NN->nOutput; k++) {
+            NN->wHiddenOutput[j][k] += d_Out[j][k];
+            d_Out[j][k] = 0.f;
+        }
+    }
+
+    // Mark weights dirty so the next forward pass re-uploads them
+    NN->weightsDirty = true;
+
+    // Reset device delta buffer for input-hidden
+    CUDA_CHECK(cudaMemset(d_dInp, 0,
+        sizeof(float) * (NN->nInput + 1) * NN->nHidden));
 }
