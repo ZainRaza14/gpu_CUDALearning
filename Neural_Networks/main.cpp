@@ -1,53 +1,43 @@
-
-#include<iostream>
-
-#include<ctime>
-
-#include<stdlib.h>
-
-#include"NN.h"
-
-#include"NN_Train.h"
-
-#include"CycleTimer.h"
+#include <iostream>
+#include <ctime>
+#include <stdlib.h>
+#include "neuralNetwork.h"
+#include "neuralNetworkTrainer.h"
+#include "CycleTimer.h"
 
 using namespace std;
 
 int main()
 {
-	double timer_Start = CycleTimer::currentSeconds();
+    double timer_Start = CycleTimer::currentSeconds();
 
-	srand((unsigned int) time(0));
+    srand((unsigned int)time(0));
 
-	dataReader dR;
+    // Load MNIST CSV: 784 pixel inputs, 10 class outputs
+    dataReader dR;
+    if (!dR.loadDataFile("mnist_train.csv", 784, 10)) {
+        cerr << "Failed to load dataset." << endl;
+        return 1;
+    }
+    dR.setNumSets(1);
 
-	dR.loadDataFile("mnist_train.csv");
+    // Network: 784 inputs, 128 hidden, 10 outputs, batch size 32
+    neuralNetwork network(784, 128, 10, 32);
+    network.printCudaInfo();
 
-	dR.setNumSets(1);
+    nnTrain trainer(&network);
+    trainer.setTrain(0.01, true);        // learning rate, use batch mode
+    trainer.setStop(100, 90);            // max 100 epochs, stop at 90% accuracy
+    trainer.e_Log("training_log.csv", 1);
 
-	NN neuralNetwork(782, 128, 10, 1);
+    for (int i = 0; i < dR.getNumTrainingSets(); i++) {
+        trainer.netTrain(dR.getTrainingDataSet());
+    }
 
-	nerualNetwork.printCudaInfo();
+    double timer_End = CycleTimer::currentSeconds();
+    double total_Time = timer_End - timer_Start;
 
-	NN_Train nerualNTraining(&nerualNetwork);
+    cout << "Total program time: " << total_Time << "s" << endl;
 
-	nerualNTraining.setTrainingParameters(0.5, false);
-
-	neuralNTraining.setStoppingConditions(100, 90);
-
-	for(int i = 0; i < dR.getNumTrainingSets() ; i++)
-	{
-
-		neuralNTraining.trainNetwork(dR.getTrainingDataSet());
-	
-	}
-
-	double timer_End = CycleTimer::currentSeconds();
-
-	double total_Time = timer_End - time_Start;
-
-	cout<< "Final Total Time of the Program: " << total_Time << endl;
-
-	return 0;
-
+    return 0;
 }

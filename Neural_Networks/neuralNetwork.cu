@@ -1,472 +1,373 @@
-
 #include <iostream>
-
 #include <vector>
-
 #include <fstream>
-
 #include <math.h>
-
 #include <stdio.h>
-
 #include <stdlib.h>
-
 #include <string.h>
-
 #include <algorithm>
-
-#include <omp.h>
-
 #include <cuda.h>
-
 #include <cuda_runtime.h>
-
-#include <driver_functions.h>
-
-#include <curand.h>
-
-#include <curand_kernel.h>
-
 #include <cublas_v2.h>
-
 #include "CycleTimer.h"
-
-#define BLOCKSIZE  1024
-
-#define TILE_WIDTH 32
-
-#define SCAN_BLOCK_DIM  BLOCKSIZE
-
-#include "exclusiveScan.cu_inl"
-
-
 #include "neuralNetwork.h"
 
 using namespace std;
 
+// ---------------------------------------------------------------------------
+// Helper macro for CUDA error checking
+// ---------------------------------------------------------------------------
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                        \
+        cudaError_t err = (call);                                               \
+        if (err != cudaSuccess) {                                               \
+            fprintf(stderr, "CUDA error at %s:%d — %s\n",                     \
+                    __FILE__, __LINE__, cudaGetErrorString(err));               \
+            exit(EXIT_FAILURE);                                                 \
+        }                                                                       \
+    } while (0)
 
-__global__ void forward_prop_kernel(float *device_output, float *input, float *weights, int num_first, int num_second) 
+#define CUBLAS_CHECK(call)                                                      \
+    do {                                                                        \
+        cublasStatus_t st = (call);                                             \
+        if (st != CUBLAS_STATUS_SUCCESS) {                                      \
+            fprintf(stderr, "cuBLAS error at %s:%d — status %d\n",            \
+                    __FILE__, __LINE__, (int)st);                               \
+            exit(EXIT_FAILURE);                                                 \
+        }                                                                       \
+    } while (0)
+
+// ---------------------------------------------------------------------------
+// Fused sigmoid activation applied in-place on a flat buffer
+// ---------------------------------------------------------------------------
+__global__ void sigmoid_inplace(float* data, int n)
 {
-
-	int Row = blockIdx.y*TILE_WIDTH + threadIdx.y; 
-
-	int Col = blockIdx.x*TILE_WIDTH + threadIdx.x;
-
-	float Pvalue = 0; 
-
-	__shared__ float prefixSumOutput[BLOCKSIZE];
-    
-    __shared__ float prefixSumScratch[2 * BLOCKSIZE]; 
-
-	for (int k = 0; k < num_second; ++k) 
-		Pvalue += input[Row*num_second+k] * weights[k*num_second+Col];
-
-	device_output[Row*num_second+Col] = Pvalue; 
-
-	__syncthreads();
-
- 	sharedMemExclusiveScan(threadIdx.x, device_output, prefixSumOutput, 
-                            prefixSumScratch, BLOCKSIZE);
-
-	__syncthreads();
-
-    if (threadIdx.x == 0 && blockIdx.x < num_second) 
-    {
-    	device_output[blockIdx.x] = 1/(1+exp(-1*prefixSumOutput[num_first]));
-    	
-    }
-
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        data[i] = 1.f / (1.f + __expf(-data[i]));
 }
 
-
-
-__global__ void
-forward_prop_kernel_batch(float *device_output, float *input, float *weights, int num_first, int num_second, int batchSize) 
+// ---------------------------------------------------------------------------
+// Sets bias neuron slots to -1.0 for every sample in a batch.
+// neurons: batchSize x stride (row-major), biasIdx = stride-1
+// ---------------------------------------------------------------------------
+__global__ void set_bias_neurons(float* neurons, int stride, int batchSize)
 {
-	int linearThreadIndex = threadIdx.x;
-	
-	int unit = blockIdx.x%num_second;
-	
-	int batch = blockIdx.x/num_second;
-
-    __shared__ float prefixSumInput[BLOCKSIZE];
-    
-    __shared__ float prefixSumOutput[BLOCKSIZE];
-    
-    __shared__ float prefixSumScratch[2 * BLOCKSIZE];
-
-    if (linearThreadIndex < num_first) 
-    {
-    	prefixSumInput[linearThreadIndex] = input[batch*linearThreadIndex] * weights[linearThreadIndex*num_second + unit];
-    }
-
-    __syncthreads();
-
-    sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, 
-                            prefixSumScratch, BLOCKSIZE);
-
-    __syncthreads();
-
-    if (linearThreadIndex == 0 && unit < num_second) 
-    {
-    	device_output[batch*unit] = 1/(1+exp(-1*prefixSumOutput[num_first]));
-    }
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < batchSize)
+        neurons[b * stride + (stride - 1)] = -1.f;
 }
 
-neuralNetwork::neuralNetwork(int nI, int nH, int nO, int bS) : nInput(nI), nHidden(nH), nOutput(nO), batchSize(bS)
-{				
-	
-	inputNeurons = new( float[batchSize*(nInput + 1)] );
-        
-        for (int b= 0; b<batchSize; b++) 
-        {
-            for (int i=0; i<nInput+1; i++) 
-            {
-                if (i==nInput) 
-                {
-                    inputNeurons[(b+1)*(nInput)] = -1;
-                }
-                
-                else 
-                {
-                    inputNeurons[b*(nInput+1) + i] = 0;
-                } 
-            
-            }
-        }
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+neuralNetwork::neuralNetwork(int nI, int nH, int nO, int bS)
+    : nInput(nI), nHidden(nH), nOutput(nO), batchSize(bS), weightsDirty(true)
+{
+    // ---- host neuron buffers ----
+    inputNeurons  = new float[batchSize * (nInput  + 1)]();
+    hiddenNeurons = new float[batchSize * (nHidden + 1)]();
+    outputNeurons = new float[batchSize * nOutput]();
 
-	hiddenNeurons = new( float[batchSize*(nHidden + 1)] );
-        
-        for (int b=0; b<batchSize; b++) 
-        {
-            for (int i=0; i<nHidden+1; i++) 
-            {
-                if (i==nHidden) 
-                {
-                    hiddenNeurons[(b+1)*(nHidden)] = -1;
-                }
-                
-                else 
-                {
-                    hiddenNeurons[b*(nHidden+1) + i] = 0; 
-                }
-            }
-        }
+    // Set bias neuron slots to -1 on the host
+    for (int b = 0; b < batchSize; b++) {
+        inputNeurons [b * (nInput  + 1) + nInput ] = -1.f;
+        hiddenNeurons[b * (nHidden + 1) + nHidden] = -1.f;
+    }
 
-	outputNeurons = new( float[batchSize*(nOutput + 1)] );
-	
-	for ( int i=0; i < batchSize*(nOutput+1); i++ ) 
-	{
-		outputNeurons[i] = 0;
-	}
+    // ---- host weight matrices (flat, row-major) ----
+    // wInputHidden[i] points into a single flat block; only [0] owns the memory.
+    wInputHidden    = new float*[nInput  + 1];
+    wInputHidden[0] = new float[(nInput  + 1) * nHidden]();
+    for (int i = 1; i <= nInput; i++)
+        wInputHidden[i] = wInputHidden[i - 1] + nHidden;
 
-	
-	wInputHidden = new( float*[nInput + 1] );
-	
-	wInputHidden[0] = new (float[(nInput + 1)*nHidden]);
-	
-	for ( int i=1; i <= nInput; i++ ) 
-	{
-		wInputHidden[i] = wInputHidden[i-1] + nHidden;
-	}
-	
-	for ( int i=0; i <= nInput; i++ ) 
-	{
-		for ( int j=0; j < nHidden; j++ ) wInputHidden[i][j] = 0;		
-	}
+    wHiddenOutput    = new float*[nHidden + 1];
+    wHiddenOutput[0] = new float[(nHidden + 1) * nOutput]();
+    for (int i = 1; i <= nHidden; i++)
+        wHiddenOutput[i] = wHiddenOutput[i - 1] + nOutput;
 
-	wHiddenOutput = new( float*[nHidden + 1] );
-	
-	wHiddenOutput[0] = new (float[(nHidden + 1)*nOutput]);
-	
-	for ( int i=1; i <= nHidden; i++ ) 
-	{
-		wHiddenOutput[i] = wHiddenOutput[i-1] + nOutput;
-	}
-	
-	for ( int i=0; i <= nHidden; i++ ) 
-	{
-		for ( int j=0; j < nOutput; j++ ) wHiddenOutput[i][j] = 0;		
-	}
-	
-	
-	initializeWeights();		
+    // ---- device buffers ----
+    CUDA_CHECK(cudaMalloc(&d_input,   sizeof(float) * batchSize * (nInput  + 1)));
+    CUDA_CHECK(cudaMalloc(&d_hidden,  sizeof(float) * batchSize * (nHidden + 1)));
+    CUDA_CHECK(cudaMalloc(&d_output1, sizeof(float) * batchSize * nHidden));
+    CUDA_CHECK(cudaMalloc(&d_output2, sizeof(float) * batchSize * nOutput));
+    CUDA_CHECK(cudaMalloc(&d_w1,      sizeof(float) * (nInput  + 1) * nHidden));
+    CUDA_CHECK(cudaMalloc(&d_w2,      sizeof(float) * (nHidden + 1) * nOutput));
+
+    // ---- cuBLAS ----
+    CUBLAS_CHECK(cublasCreate(&cublasHandle));
+
+    // ---- weight initialisation ----
+    initializeWeights();
 }
 
-
+// ---------------------------------------------------------------------------
+// Destructor
+// ---------------------------------------------------------------------------
 neuralNetwork::~neuralNetwork()
 {
-	
-	delete[] inputNeurons;
-	
-	delete[] hiddenNeurons;
-	
-	delete[] outputNeurons;
+    delete[] inputNeurons;
+    delete[] hiddenNeurons;
+    delete[] outputNeurons;
 
-	for (int i=0; i <= nInput; i++) delete[] wInputHidden[i];
-	
-	delete[] wInputHidden;
+    // Only [0] owns the flat allocation; others are interior pointers
+    delete[] wInputHidden[0];
+    delete[] wInputHidden;
+    delete[] wHiddenOutput[0];
+    delete[] wHiddenOutput;
 
-	for (int j=0; j <= nHidden; j++) delete[] wHiddenOutput[j];
-	
-	delete[] wHiddenOutput;
+    cudaFree(d_input);
+    cudaFree(d_hidden);
+    cudaFree(d_output1);
+    cudaFree(d_output2);
+    cudaFree(d_w1);
+    cudaFree(d_w2);
 
-	
-	cudaFree(device_output1);
-	
-	cudaFree(input);
-	
-	cudaFree(w1);
-
-	cudaFree(device_output2);
-	
-	cudaFree(hidden);
-	
-	cudaFree(w2);
-
+    cublasDestroy(cublasHandle);
 }
 
-bool neuralNetwork::saveWeights(char* filename)
-{
-	
-	fstream outputFile;
-	
-	outputFile.open(filename, ios::out);
-
-	if ( outputFile.is_open() )
-	{
-		outputFile.precision(50);		
-
-		
-		for ( int i=0; i <= nInput; i++ ) 
-		{
-			for ( int j=0; j < nHidden; j++ ) 
-			{
-				outputFile << wInputHidden[i][j] << ",";				
-			}
-		}
-		
-		for ( int i=0; i <= nHidden; i++ ) 
-		{		
-			for ( int j=0; j < nOutput; j++ ) 
-			{
-				outputFile << wHiddenOutput[i][j];					
-				
-				if ( i * nOutput + j + 1 != (nHidden + 1) * nOutput ) outputFile << ",";
-			}
-		}
-
-	
-		cout << endl << "Neuron weights saved to '" << filename << "'" << endl;
-
-		
-		outputFile.close();
-		
-		return true;
-	}
-	
-	else 
-	{
-		cout << endl << "Error - Weight output file '" << filename << "' could not be created: " << endl;
-		return false;
-	}
-}
-
-
-double neuralNetwork::getSetAccuracy( std::vector<dataEntry*>& set )
-{
-	double incorrectResults = 0;
-		
-	
-	for ( int tp = 0; tp < (int) set.size(); tp++)
-	{						
-		
-		feedForward( set[tp]->pattern );
-
-		int predicted = distance(outputNeurons, max_element(outputNeurons, outputNeurons + nOutput));
-		i
-		int expected = distance(set[tp]->target, max_element(set[tp]->target, set[tp]->target + nOutput));
-		
-		if (predicted != expected) incorrectResults++;	
-		
-	}
-	
-
-	return 100 - (incorrectResults/set.size() * 100);
-}
-
-
-
+// ---------------------------------------------------------------------------
+// Xavier uniform weight initialisation
+// ---------------------------------------------------------------------------
 void neuralNetwork::initializeWeights()
 {
-	double startTime = CycleTimer::currentSeconds();
+    // Layer 1: fan_in = nInput+1, fan_out = nHidden
+    float limit1 = sqrtf(6.f / (float)(nInput + 1 + nHidden));
+    for (int i = 0; i <= nInput; i++)
+        for (int j = 0; j < nHidden; j++)
+            wInputHidden[i][j] = limit1 * (2.f * ((float)rand() / RAND_MAX) - 1.f);
 
-	cudaMalloc(&device_output1, sizeof(float) * batchSize*nHidden);
-    
-    cudaMalloc(&input, sizeof(float) * batchSize*(nInput+1));
-    
-    cudaMalloc(&w1, sizeof(float) * (nInput+1)*nHidden);
+    // Layer 2: fan_in = nHidden+1, fan_out = nOutput
+    float limit2 = sqrtf(6.f / (float)(nHidden + 1 + nOutput));
+    for (int i = 0; i <= nHidden; i++)
+        for (int j = 0; j < nOutput; j++)
+            wHiddenOutput[i][j] = limit2 * (2.f * ((float)rand() / RAND_MAX) - 1.f);
 
-    cudaMalloc(&device_output2, sizeof(float) * batchSize*nOutput);
-    
-    cudaMalloc(&hidden, sizeof(float) * batchSize*(nHidden+1));
-    
-    cudaMalloc(&w2, sizeof(float) * (nHidden+1)*nOutput);
-    
-	for(int i = 0; i <= nInput; i++)
-	{		
-		for(int j = 0; j < nHidden; j++) 
-		{
-			
-			wInputHidden[i][j] = ( (( (float)(rand()%1000)+1)/1000)/10 - 0.05);
-		}
-	}
-	
-	
-	for(int i = 0; i <= nHidden; i++)
-	{		
-		for(int j = 0; j < nOutput; j++) 
-		{
-			wHiddenOutput[i][j] = ( (( (float)(rand()%1000)+1)/1000)/10 - 0.05);
-		}
-	}
-	
-	double endTime = CycleTimer::currentSeconds();
-    
-    double overallDuration = endTime - startTime;
-
-    printf("Time Taken Seq:%f\n", overallDuration);
+    weightsDirty = true;
 }
 
-inline float neuralNetwork::activationFunction( float x )
+// ---------------------------------------------------------------------------
+// Uploads weight matrices to the device when they have been modified.
+// Called lazily at the start of every forward pass.
+// ---------------------------------------------------------------------------
+static inline void uploadWeightsIfDirty(neuralNetwork* nn)
 {
-	return 1/(1+exp(-x));
-}	
-
-void neuralNetwork::feedForwardBatch(vector<float*> patternVector) 
-{
-
-	for (int b = 0; b<batchSize; b++) 
-	{
-	    for(int i = 0; i < nInput+1; i++) 
-	    { 
-                if (i!=nInput) 
-                {
-                    inputNeurons[b*(nInput+1) + i] = patternVector[b][i];
-                }
-        
-        }
-	}
-
-	dim3 blockDim(1024,1);
-    
-    dim3 gridDim(nHidden*batchSize);
-    
-    cudaMemcpy(input, inputNeurons, sizeof(float) * batchSize*(nInput+1), cudaMemcpyHostToDevice);
-    
-    cudaMemcpy(w1, wInputHidden[0], (nInput+1)*nHidden*sizeof(float), cudaMemcpyHostToDevice);
-    
-    forward_prop_kernel_batch<<<gridDim, blockDim>>>(device_output1, input, w1, nInput+1, nHidden, batchSize);
-    
-    cudaThreadSynchronize();
-    
-    cudaMemcpy(hiddenNeurons, device_output1, batchSize*nHidden*sizeof(float), cudaMemcpyDeviceToHost);
-
-
-    dim3 gridDim2(nOutput*batchSize);
-	
-	cudaMemcpy(hidden, hiddenNeurons, sizeof(float) * batchSize*(nHidden+1), cudaMemcpyHostToDevice);
-	
-	cudaMemcpy(w2, wHiddenOutput[0], (nHidden+1)*nOutput*sizeof(float), cudaMemcpyHostToDevice);
-	
-	forward_prop_kernel_batch<<<gridDim2, blockDim>>>(device_output2, hidden, w2, nHidden+1, nOutput,batchSize);
-	
-	cudaThreadSynchronize();
-	
-	cudaMemcpy(outputNeurons, device_output2, batchSize*nOutput*sizeof(float), cudaMemcpyDeviceToHost);
-
-
+    if (!nn->weightsDirty) return;
+    CUDA_CHECK(cudaMemcpy(nn->d_w1, nn->wInputHidden[0],
+        sizeof(float) * (nn->nInput + 1) * nn->nHidden,
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(nn->d_w2, nn->wHiddenOutput[0],
+        sizeof(float) * (nn->nHidden + 1) * nn->nOutput,
+        cudaMemcpyHostToDevice));
+    nn->weightsDirty = false;
 }
 
+// ---------------------------------------------------------------------------
+// Single-sample forward pass (used for accuracy evaluation)
+//
+// cuBLAS GEMV: d_output = sigmoid(W^T * input)
+//
+// Memory layout (row-major on host / as stored in device buffers):
+//   d_w1  : (nInput+1) x nHidden   → cuBLAS sees (nHidden, nInput+1) col-major
+//   d_input: vector of size (nInput+1)
+//   d_output1: vector of size nHidden
+// ---------------------------------------------------------------------------
 void neuralNetwork::feedForward(float* pattern)
 {
-	
-	for(int i = 0; i < nInput; i++) 
-	{
-		inputNeurons[i] = pattern[i];
-	}
+    // Pack input (bias slot was pre-set to -1)
+    for (int i = 0; i < nInput; i++)
+        inputNeurons[i] = pattern[i];
 
-	double startTime = CycleTimer::currentSeconds();
-	
-	
-	dim3 blockDim(1024, 1);
-    
-    dim3 gridDim(128);
-	
-    cudaMemcpy(input, inputNeurons, sizeof(float) * (nInput+1), cudaMemcpyHostToDevice);
-   
-    
-    cudaMemcpy(w1, wInputHidden[0], (nInput+1)*nHidden*sizeof(float), cudaMemcpyHostToDevice);
-    
+    uploadWeightsIfDirty(this);
 
-	forward_prop_kernel<<<gridDim, blockDim>>>(device_output1, input, w1, nInput+1, nHidden);
+    CUDA_CHECK(cudaMemcpy(d_input, inputNeurons,
+        sizeof(float) * (nInput + 1), cudaMemcpyHostToDevice));
 
-	cudaThreadSynchronize();
-	
+    const float alpha = 1.f, beta = 0.f;
 
-    cudaMemcpy(hiddenNeurons, device_output1, nHidden*sizeof(float), cudaMemcpyDeviceToHost);
-	
+    // Layer 1: d_output1 = d_w1^T * d_input  (dim: nHidden)
+    // cuBLAS col-major: d_w1 is (nHidden x (nInput+1)), CUBLAS_OP_N gives nHidden-dim output
+    CUBLAS_CHECK(cublasSgemv(cublasHandle, CUBLAS_OP_N,
+        nHidden, nInput + 1,
+        &alpha, d_w1, nHidden,
+        d_input, 1,
+        &beta, d_output1, 1));
 
-    dim3 gridDim2(10);
-	
-    cudaMemcpy(hidden, hiddenNeurons, sizeof(float) * (nHidden+1), cudaMemcpyHostToDevice);
-   
-    
-    cudaMemcpy(w2, wHiddenOutput[0], (nHidden+1)*nOutput*sizeof(float), cudaMemcpyHostToDevice);
-    
+    int n1 = nHidden;
+    sigmoid_inplace<<<(n1 + 255) / 256, 256>>>(d_output1, n1);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-	forward_prop_kernel<<<gridDim2, blockDim>>>(device_output2, hidden, w2, nHidden+1, nOutput);
+    // Copy hidden activations back and restore bias
+    CUDA_CHECK(cudaMemcpy(hiddenNeurons, d_output1,
+        sizeof(float) * nHidden, cudaMemcpyDeviceToHost));
+    hiddenNeurons[nHidden] = -1.f;
 
-	cudaThreadSynchronize();
+    CUDA_CHECK(cudaMemcpy(d_hidden, hiddenNeurons,
+        sizeof(float) * (nHidden + 1), cudaMemcpyHostToDevice));
 
+    // Layer 2: d_output2 = d_w2^T * d_hidden  (dim: nOutput)
+    CUBLAS_CHECK(cublasSgemv(cublasHandle, CUBLAS_OP_N,
+        nOutput, nHidden + 1,
+        &alpha, d_w2, nOutput,
+        d_hidden, 1,
+        &beta, d_output2, 1));
 
-	cudaMemcpy(outputNeurons, device_output2, nOutput*sizeof(float), cudaMemcpyDeviceToHost);
+    int n2 = nOutput;
+    sigmoid_inplace<<<(n2 + 255) / 256, 256>>>(d_output2, n2);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-	cudaMemcpy(outputNeurons, device_output2, nOutput*sizeof(float), cudaMemcpyDeviceToHost);
-
-	double endTime4 = CycleTimer::currentSeconds();
-
-	double time = endTime4 - startTime;
-	
+    CUDA_CHECK(cudaMemcpy(outputNeurons, d_output2,
+        sizeof(float) * nOutput, cudaMemcpyDeviceToHost));
 }
 
+// ---------------------------------------------------------------------------
+// Batched forward pass (used during training)
+//
+// cuBLAS GEMM: D_output = sigmoid(W^T * D_input)
+//
+// For a batch of B samples:
+//   d_input  : B x (nInput+1)  row-major → cuBLAS (nInput+1, B) col-major
+//   d_w1     : (nInput+1) x nHidden → cuBLAS (nHidden, nInput+1) col-major
+//   d_output1: B x nHidden result
+//
+// cuBLAS SGEMM (col-major):  C = alpha * A * B + beta * C
+//   A = d_w1   : (nHidden   x (nInput+1))
+//   B = d_input: ((nInput+1) x batchSize)
+//   C = d_output1: (nHidden x batchSize)
+// ---------------------------------------------------------------------------
+void neuralNetwork::feedForwardBatch(std::vector<float*>& patternVector)
+{
+    int B = (int)patternVector.size();
+
+    // Pack input batch (bias slots pre-set to -1 in constructor)
+    for (int b = 0; b < B; b++)
+        for (int i = 0; i < nInput; i++)
+            inputNeurons[b * (nInput + 1) + i] = patternVector[b][i];
+
+    uploadWeightsIfDirty(this);
+
+    CUDA_CHECK(cudaMemcpy(d_input, inputNeurons,
+        sizeof(float) * B * (nInput + 1), cudaMemcpyHostToDevice));
+
+    const float alpha = 1.f, beta = 0.f;
+
+    // Layer 1: d_output1 (nHidden x B) = d_w1 (nHidden x (nInput+1)) * d_input ((nInput+1) x B)
+    CUBLAS_CHECK(cublasSgemm(cublasHandle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        nHidden, B, nInput + 1,
+        &alpha, d_w1, nHidden,
+        d_input, nInput + 1,
+        &beta, d_output1, nHidden));
+
+    int n1 = B * nHidden;
+    sigmoid_inplace<<<(n1 + 255) / 256, 256>>>(d_output1, n1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Copy hidden activations back to host, set bias neurons, re-upload
+    CUDA_CHECK(cudaMemcpy(hiddenNeurons, d_output1,
+        sizeof(float) * B * nHidden, cudaMemcpyDeviceToHost));
+
+    for (int b = 0; b < B; b++)
+        hiddenNeurons[b * (nHidden + 1) + nHidden] = -1.f;
+
+    CUDA_CHECK(cudaMemcpy(d_hidden, hiddenNeurons,
+        sizeof(float) * B * (nHidden + 1), cudaMemcpyHostToDevice));
+
+    // Layer 2: d_output2 (nOutput x B) = d_w2 (nOutput x (nHidden+1)) * d_hidden ((nHidden+1) x B)
+    CUBLAS_CHECK(cublasSgemm(cublasHandle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        nOutput, B, nHidden + 1,
+        &alpha, d_w2, nOutput,
+        d_hidden, nHidden + 1,
+        &beta, d_output2, nOutput));
+
+    int n2 = B * nOutput;
+    sigmoid_inplace<<<(n2 + 255) / 256, 256>>>(d_output2, n2);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(outputNeurons, d_output2,
+        sizeof(float) * B * nOutput, cudaMemcpyDeviceToHost));
+}
+
+// ---------------------------------------------------------------------------
+// Activation function (host-side, used for reference only)
+// ---------------------------------------------------------------------------
+inline float neuralNetwork::activationFunction(float x)
+{
+    return 1.f / (1.f + expf(-x));
+}
+
+// ---------------------------------------------------------------------------
+// Evaluate classification accuracy on a data set
+// ---------------------------------------------------------------------------
+double neuralNetwork::getSetAccuracy(std::vector<dataEntry*>& set)
+{
+    double incorrect = 0;
+
+    for (int tp = 0; tp < (int)set.size(); tp++) {
+        feedForward(set[tp]->pattern);
+
+        int predicted = (int)distance(outputNeurons,
+            max_element(outputNeurons, outputNeurons + nOutput));
+        int expected  = (int)distance(set[tp]->target,
+            max_element(set[tp]->target, set[tp]->target + nOutput));
+
+        if (predicted != expected)
+            incorrect++;
+    }
+
+    return 100.0 - (incorrect / set.size() * 100.0);
+}
+
+// ---------------------------------------------------------------------------
+// Save weights to CSV
+// ---------------------------------------------------------------------------
+bool neuralNetwork::saveWeights(char* filename)
+{
+    fstream out;
+    out.open(filename, ios::out);
+    if (!out.is_open()) {
+        cout << "Error: cannot open '" << filename << "'" << endl;
+        return false;
+    }
+
+    out.precision(10);
+    for (int i = 0; i <= nInput; i++)
+        for (int j = 0; j < nHidden; j++)
+            out << wInputHidden[i][j] << ",";
+
+    for (int i = 0; i <= nHidden; i++)
+        for (int j = 0; j < nOutput; j++) {
+            out << wHiddenOutput[i][j];
+            if (i * nOutput + j + 1 != (nHidden + 1) * nOutput)
+                out << ",";
+        }
+
+    cout << "Weights saved to '" << filename << "'" << endl;
+    out.close();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Print CUDA device info
+// ---------------------------------------------------------------------------
 void neuralNetwork::printCudaInfo()
 {
-
     int deviceCount = 0;
-    
-    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+    cudaGetDeviceCount(&deviceCount);
 
     printf("---------------------------------------------------------\n");
-    
-    printf("Found %d CUDA devices\n", deviceCount);
+    printf("Found %d CUDA device(s)\n", deviceCount);
 
-    for (int i=0; i<deviceCount; i++)
-    {
-        cudaDeviceProp deviceProps;
-        
-        cudaGetDeviceProperties(&deviceProps, i);
-        
-        printf("Device %d: %s\n", i, deviceProps.name);
-        
-        printf("   SMs:        %d\n", deviceProps.multiProcessorCount);
-        
+    for (int i = 0; i < deviceCount; i++) {
+        cudaDeviceProp p;
+        cudaGetDeviceProperties(&p, i);
+        printf("Device %d: %s\n", i, p.name);
+        printf("   SMs:        %d\n", p.multiProcessorCount);
         printf("   Global mem: %.0f MB\n",
-               static_cast<float>(deviceProps.totalGlobalMem) / (1024 * 1024));
-        
-        printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
+               (float)p.totalGlobalMem / (1024.f * 1024.f));
+        printf("   CUDA Cap:   %d.%d\n", p.major, p.minor);
     }
-    
-    printf("---------------------------------------------------------\n"); 
+    printf("---------------------------------------------------------\n");
 }
-
